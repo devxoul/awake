@@ -36,11 +36,17 @@ jobs:
       - name: Create GitHub Release
         run: gh release create "$VERSION" --generate-notes
 
-      - name: Update Homebrew formula
+      - name: Update Homebrew tap
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           url="https://github.com/${{ github.repository }}/archive/refs/tags/$VERSION.tar.gz"
           sha=$(curl -fsSL "$url" | sha256sum | cut -d' ' -f1)
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/devxoul/homebrew-tap.git" tap
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           sed -i -E "s|^  url \".*\"|  url \"$url\"|; s|^  sha256 \".*\"|  sha256 \"$sha\"|" Formula/awake.rb
           git add Formula/awake.rb
-          git commit -m "Update formula to $VERSION"
+          git commit -m "awake $VERSION"
           git push origin HEAD
