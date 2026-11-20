@@ -1,0 +1,189 @@
+#!/usr/bin/env zsh
+# awake - Keep the Mac running with the lid closed, but let the screen go dark.
+#
+#   awake on      disable sleep + start the clamshell watcher
+#   awake off     stop the watcher + restore sleep
+#   awake status  show current state (default)
+#
+# Lid open   -> display never idles (a held `caffeinate -d` assertion)
+# Lid closed -> display sleeps, keyboard backlight off, machine stays up
+# Reopening   -> keyboard backlight goes back to its last non-zero level
+# Lid closed + offline -> Wi-Fi is power-cycled so macOS rescans and auto-joins
+#   a known network; failing that, each preferred network is tried in order.
+#   Checks back off from 30s to 5min while nothing joinable is in range.
+#
+# Only `disablesleep` is mutated globally; it is restored on `off`.
+#
+# Keyboard backlight goes through CoreBrightness (no public CLI exists), so a
+# ~20-line helper is compiled on first use. Without clang the watcher still
+# runs, just without backlight control.
+
+PIDFILE="${TMPDIR:-/tmp}/awake.pid"
+KBD_BIN="${TMPDIR:-/tmp}/awake-kbd"
+
+lid() {
+  local state
+  state=$(ioreg -r -k AppleClamshellState -d 4 | awk -F'= ' '/AppleClamshellState/ { print $2; exit }')
+  [[ $state == Yes ]] && echo closed || echo open
+}
+
+watcher_pid() {
+  local pid
+  [[ -f $PIDFILE ]] || return 1
+  pid=$(<"$PIDFILE")
+  if ! kill -0 "$pid" 2>/dev/null; then
+    rm -f "$PIDFILE"
+    return 1
+  fi
+  echo "$pid"
+}
+
+kbd_build() {
+  [[ -x $KBD_BIN ]] && return 0
+  command -v clang >/dev/null || return 1
+  clang -fobjc-arc -x objective-c -o "$KBD_BIN" - -framework Foundation 2>/dev/null <<'OBJC'
+#import <Foundation/Foundation.h>
+#include <dlfcn.h>
+
+// Private API. Brightness is 0.0-1.0; keyboard 1 is the built-in one.
+@interface KeyboardBrightnessClient : NSObject
+- (float)brightnessForKeyboard:(unsigned long long)keyboard;
+- (BOOL)setBrightness:(float)brightness forKeyboard:(unsigned long long)keyboard;
+@end
+
+int main(int argc, char **argv) {
+  @autoreleasepool {
+    if (!dlopen("/System/Library/PrivateFrameworks/CoreBrightness.framework/CoreBrightness", RTLD_LAZY)) return 1;
+    KeyboardBrightnessClient *client = [[NSClassFromString(@"KeyboardBrightnessClient") alloc] init];
+    if (!client) return 1;
+    if (argc > 1) return [client setBrightness:atof(argv[1]) forKeyboard:1] ? 0 : 1;
+    printf("%f\n", [client brightnessForKeyboard:1]);
+  }
+  return 0;
+}
+OBJC
+}
+
+# kbd        -> print current brightness
+# kbd <0-1>  -> set brightness
+kbd() { [[ -x $KBD_BIN ]] && "$KBD_BIN" "$@" 2>/dev/null }
+
+online() {
+  route -n get default >/dev/null 2>&1 \
+    && curl -fsS -m 5 -o /dev/null http://captive.apple.com/hotspot-detect.html 2>/dev/null
+}
+
+# Find and join a known Wi-Fi network. Passwords come from the keychain.
+wifi_join() {
+  local dev ssid
+  dev=$(networksetup -listallhardwareports | awk '/Wi-Fi/ { getline; print $2; exit }')
+  [[ -n $dev ]] || return 1
+  # With the display off, auto-join can sit idle; a power cycle forces a rescan.
+  networksetup -setairportpower "$dev" off
+  networksetup -setairportpower "$dev" on
+  repeat 10; do
+    sleep 2
+    online && return 0
+  done
+  # Scan results are redacted without Location access, so just try each saved
+  # network; ones out of range fail fast.
+  for ssid in ${(f)"$(networksetup -listpreferredwirelessnetworks "$dev" | tail -n +2 | sed 's/^[[:space:]]*//')"}; do
+    networksetup -setairportnetwork "$dev" "$ssid" >/dev/null 2>&1
+    sleep 3
+    online && return 0
+  done
+  return 1
+}
+
+# Background loop. Not meant to be called directly.
+watch() {
+  local caff="" last_on="" prev="" state cur net_at=0 net_wait=30
+
+  uncaffeinate() {
+    if [[ -n $caff ]]; then
+      kill "$caff" 2>/dev/null
+      caff=""
+    fi
+  }
+  # Wake races the ambient-light controller, so reassert a few times.
+  restore_kbd() {
+    [[ -n $last_on ]] || return
+    repeat 3; do
+      kbd "$last_on"
+      sleep 0.5
+    done
+  }
+  trap 'uncaffeinate; restore_kbd; exit 0' TERM INT
+
+  while :; do
+    state=$(lid)
+    if [[ $state != $prev ]]; then
+      if [[ $state == closed ]]; then
+        uncaffeinate
+        kbd 0
+        pmset displaysleepnow
+      else
+        restore_kbd
+        caffeinate -d &
+        caff=$!
+      fi
+      prev=$state
+    elif [[ $state == open ]]; then
+      # Sample while the lid is open; macOS zeroes the backlight the moment it
+      # closes, so reading it at close time would only ever save 0.
+      cur=$(kbd)
+      [[ -n $cur ]] && (( cur > 0 )) && last_on=$cur
+    fi
+    if [[ $state == closed ]] && (( SECONDS >= net_at )); then
+      if online || wifi_join; then
+        net_wait=30
+      else
+        (( net_wait = net_wait * 2 > 300 ? 300 : net_wait * 2 ))
+      fi
+      (( net_at = SECONDS + net_wait ))
+    fi
+    sleep 2
+  done
+}
+
+case "${1:-status}" in
+  on)
+    if watcher_pid >/dev/null; then
+      echo "already on"
+      exit 0
+    fi
+    kbd_build || echo "note: clang unavailable, keyboard backlight left alone" >&2
+    sudo pmset -a disablesleep 1 || exit 1
+    nohup "$0" __watch >/dev/null 2>&1 &
+    echo $! >"$PIDFILE"
+    echo "on (pid $(<"$PIDFILE"))"
+    ;;
+
+  off)
+    pid=$(watcher_pid) && kill "$pid" 2>/dev/null
+    rm -f "$PIDFILE"
+    sudo pmset -a disablesleep 0 || exit 1
+    echo "off"
+    ;;
+
+  status)
+    kbd_build
+    if pid=$(watcher_pid); then
+      echo "watcher  on (pid $pid)"
+    else
+      echo "watcher  off"
+    fi
+    echo "lid      $(lid)"
+    [[ $(pmset -g | awk '/SleepDisabled/ { print $2 }') == 1 ]] \
+      && echo "sleep    disabled" \
+      || echo "sleep    enabled"
+    echo "kbd      ${$(kbd):-n/a}"
+    ;;
+
+  __watch) watch ;;
+
+  *)
+    echo "usage: awake [on|off|status]" >&2
+    exit 1
+    ;;
+esac
