@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version (x.y.z)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.version }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump version, commit and tag
+        run: |
+          sed -i "s/^version: .*/version: $VERSION/" skills/awake/SKILL.md
+          git add skills/awake/SKILL.md
+          git diff --staged --quiet || git commit -m "$VERSION"
+          git tag "$VERSION"
+          git push origin HEAD --tags
+
+      - name: Create GitHub Release
+        run: gh release create "$VERSION" --generate-notes
+
+      - name: Update Homebrew formula
+        run: |
+          url="https://github.com/${{ github.repository }}/archive/refs/tags/$VERSION.tar.gz"
+          sha=$(curl -fsSL "$url" | sha256sum | cut -d' ' -f1)
+          sed -i -E "s|^  url \".*\"|  url \"$url\"|; s|^  sha256 \".*\"|  sha256 \"$sha\"|" Formula/awake.rb
+          git add Formula/awake.rb
+          git commit -m "Update formula to $VERSION"
+          git push origin HEAD
