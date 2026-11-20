@@ -14,8 +14,7 @@ Keep your MacBook running with the lid closed, and let the screen go dark.
 ### Homebrew
 
 ```bash
-brew tap devxoul/awake https://github.com/devxoul/awake
-brew install devxoul/awake/awake
+brew install devxoul/tap/awake
 ```
 
 ### Manually

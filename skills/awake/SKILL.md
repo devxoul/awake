@@ -10,7 +10,7 @@ metadata:
         - awake
     install:
       - kind: brew
-        formula: devxoul/awake/awake
+        formula: devxoul/tap/awake
         bins: [awake]
 ---
 
